@@ -47,6 +47,7 @@ import logging
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -79,6 +80,13 @@ _PLANE_DEFAULTS: dict[str, Optional[str]] = {
     'request-plane': 'tcp',
     'event-plane': 'zmq',
 }
+
+# Dynamo parses DYN_SYSTEM_PORT as a signed 16-bit integer, so the per-engine
+# system/health port must be <= 32767. OS-assigned ephemeral ports (what
+# subprocess_server.pick_port returns) live in the 32768-60999 range on Linux
+# and overflow, so engine system ports are drawn from the low i16 range below.
+_MAX_I16_PORT = 32767
+_SYSTEM_PORT_RANGE_START = 20000
 
 # Frontend/engine keys whose values the runtime computes from the typed config.
 # Passing them again through ``frontend_kwargs`` would let the caller silently
@@ -278,6 +286,43 @@ def _http_json(url: str, timeout: float = 2.0) -> Optional[Any]:
     return None
 
 
+def _pick_low_ports(
+    count: int,
+    low: int = _SYSTEM_PORT_RANGE_START,
+    high: int = _MAX_I16_PORT) -> list[int]:
+  """Return ``count`` distinct free TCP ports in ``[low, high]`` (<= i16 max).
+
+  Used for ``DYN_SYSTEM_PORT``, which Dynamo parses as a signed 16-bit int, so
+  the ephemeral ports ``subprocess_server.pick_port`` returns (>= 32768)
+  overflow. Candidate ports are bound explicitly and the sockets are held open
+  until all are chosen, so the returned ports are distinct and currently free
+  (subject to the same close-then-reuse race as ``pick_port``).
+  """
+  sockets: list[socket.socket] = []
+  ports: list[int] = []
+  try:
+    candidate = low
+    while len(ports) < count and candidate <= high:
+      s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      try:
+        s.bind(('localhost', candidate))
+      except OSError:
+        s.close()
+        candidate += 1
+        continue
+      sockets.append(s)
+      ports.append(candidate)
+      candidate += 1
+    if len(ports) < count:
+      raise RuntimeError(
+          f'Could not find {count} free port(s) in [{low}, {high}] for '
+          'DYN_SYSTEM_PORT.')
+    return ports
+  finally:
+    for s in sockets:
+      s.close()
+
+
 class _DynamoLocalRuntime:
   """Owns one etcd + frontend + N GPU-pinned engine topology.
 
@@ -452,21 +497,30 @@ class _DynamoLocalRuntime:
       self._manage_etcd = uses_etcd
 
   def _allocate_ports(self) -> dict[str, int]:
-    # Allocate every port for the whole topology in ONE pick_port call so the
-    # returned ports are guaranteed distinct (pick_port holds each socket open
-    # until all are chosen). Ordering: frontend http, [etcd client, etcd peer],
-    # then per-engine system (+ event when publishing KV events).
-    slots = ['frontend_http']
-    if self._manage_etcd:
-      slots += ['etcd_client', 'etcd_peer']
+    num_engines = len(self._config.engines)
     publish_events = self._config.kv_event_mode == 'zmq'
-    for idx in range(len(self._config.engines)):
-      slots.append(f'engine_{idx}_system')
-      if publish_events:
-        slots.append(f'engine_{idx}_event')
 
-    picked = subprocess_server.pick_port(*([None] * len(slots)))
-    ports = dict(zip(slots, picked))
+    # Engine system ports must fit in an i16 (<= 32767), so they are drawn from
+    # the low range rather than the ephemeral range pick_port returns.
+    system_ports = _pick_low_ports(num_engines)
+
+    # Everything else is an ordinary u16 port (frontend HTTP, etcd client/peer,
+    # ZMQ KV-event publishers). Allocate them in ONE pick_port call so the
+    # returned ports are guaranteed distinct (pick_port holds each socket open
+    # until all are chosen). These are always >= 32768, disjoint from the low
+    # system ports above.
+    ephemeral_slots = ['frontend_http']
+    if self._manage_etcd:
+      ephemeral_slots += ['etcd_client', 'etcd_peer']
+    for idx in range(num_engines):
+      if publish_events:
+        ephemeral_slots.append(f'engine_{idx}_event')
+
+    ephemeral = subprocess_server.pick_port(*([None] * len(ephemeral_slots)))
+    ports = dict(zip(ephemeral_slots, ephemeral))
+    for idx in range(num_engines):
+      ports[f'engine_{idx}_system'] = system_ports[idx]
+
     if len(set(ports.values())) != len(ports):
       raise RuntimeError(f'Port allocation produced duplicates: {ports}')
     return ports
@@ -549,10 +603,9 @@ class _DynamoLocalRuntime:
       if engine.gpu_devices:
         env['CUDA_VISIBLE_DEVICES'] = ','.join(engine.gpu_devices)
       if engine.system_port is not None:
+        # Distinct per engine so the two system/health servers do not collide.
+        # Must be <= 32767 (Dynamo parses it as i16); see _pick_low_ports.
         env['DYN_SYSTEM_PORT'] = str(engine.system_port)
-      # The system health endpoint reports not-ready until 'generate' is
-      # registered and healthy, so readiness reflects a truly usable engine.
-      env['DYN_SYSTEM_USE_ENDPOINT_HEALTH_STATUS'] = '["generate"]'
     return env
 
   def _launch(self, managed: _ManagedProcess, is_engine: bool) -> None:

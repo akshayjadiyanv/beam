@@ -213,6 +213,29 @@ class DynamoRuntimeTopologyTest(unittest.TestCase):
     all_ports = system_ports + [int(p) for p in event_ports] + [frontend_port]
     self.assertEqual(len(all_ports), len(set(all_ports)))
 
+  def test_system_ports_fit_in_signed_int16(self):
+    # DYN_SYSTEM_PORT is parsed as an i16 by Dynamo; ephemeral ports (>= 32768)
+    # overflow and crash the worker, so every engine system port must be <=
+    # 32767. No engine may inherit an ephemeral DYN_SYSTEM_PORT.
+    _, rec = _start_with_external_etcd(self._two_engine_kv_config())
+    system_ports = [int(e['env']['DYN_SYSTEM_PORT']) for e in rec.engines()]
+    self.assertEqual(len(system_ports), 2)
+    for port in system_ports:
+      self.assertLessEqual(port, dr._MAX_I16_PORT)
+      self.assertGreater(port, 0)
+
+  def test_deprecated_health_status_env_not_set(self):
+    _, rec = _start_with_external_etcd(self._two_engine_kv_config())
+    for engine in rec.engines():
+      self.assertNotIn('DYN_SYSTEM_USE_ENDPOINT_HEALTH_STATUS', engine['env'])
+
+  def test_pick_low_ports_distinct_and_in_range(self):
+    ports = dr._pick_low_ports(4)
+    self.assertEqual(len(ports), 4)
+    self.assertEqual(len(set(ports)), 4)
+    for port in ports:
+      self.assertLessEqual(port, dr._MAX_I16_PORT)
+
   def test_real_kv_mode_enables_events_and_drops_no_router_flag(self):
     _, rec = _start_with_external_etcd(self._two_engine_kv_config())
     frontend = rec.frontend()['cmd']
