@@ -31,6 +31,8 @@ from typing import Optional
 import apache_beam as beam
 from apache_beam.ml.inference.base import PredictionResult
 from apache_beam.ml.inference.base import RunInference
+from apache_beam.ml.inference.vllm_inference import DynamoRuntimeConfig
+from apache_beam.ml.inference.vllm_inference import DynamoVLLMEngineSpec
 from apache_beam.ml.inference.vllm_inference import OpenAIChatMessage
 from apache_beam.ml.inference.vllm_inference import VLLMChatModelHandler
 from apache_beam.ml.inference.vllm_inference import VLLMCompletionsModelHandler
@@ -147,12 +149,78 @@ def parse_known_args(argv):
           'ai-dynamo[vllm] and the etcd binary in the runtime environment. '
           'See VLLMCompletionsModelHandler for limitations of embedded mode.'))
   parser.add_argument(
+      '--dynamo_engines',
+      dest='dynamo_engines',
+      type=int,
+      default=1,
+      help=(
+          'Number of GPU-pinned dynamo.vllm engines (requires that many GPUs). '
+          'The default of 1 is the legacy single-engine embedded mode. Use 2+ '
+          'with --dynamo_router_mode kv to exercise KV-aware routing.'))
+  parser.add_argument(
+      '--dynamo_gpu_devices',
+      dest='dynamo_gpu_devices',
+      type=str,
+      default=None,
+      help=(
+          'Comma-separated GPU ordinal per engine, e.g. "0,1" for two '
+          'one-GPU engines. Defaults to 0..N-1 when --dynamo_engines > 1.'))
+  parser.add_argument(
+      '--dynamo_router_mode',
+      dest='dynamo_router_mode',
+      type=str,
+      default='round-robin',
+      choices=['round-robin', 'kv'],
+      help='dynamo.frontend router mode.')
+  parser.add_argument(
+      '--dynamo_kv_event_mode',
+      dest='dynamo_kv_event_mode',
+      type=str,
+      default='disabled',
+      choices=['disabled', 'approximate', 'zmq'],
+      help='How KV-cache state reaches the router (real events use "zmq").')
+  parser.add_argument(
       '--max_tokens',
       dest='max_tokens',
       type=int,
       default=16,
       help='Maximum number of tokens to generate for each example.')
   return parser.parse_known_args(argv)
+
+
+def build_dynamo_runtime_config(known_args):
+  """Build a :class:`DynamoRuntimeConfig` from the CLI flags, or ``None``.
+
+  Returns ``None`` for the legacy single-engine defaults so ``use_dynamo=True``
+  keeps its original one-engine, round-robin, KV-events-disabled behaviour and
+  the existing single-GPU integration test is unchanged.
+  """
+  if not known_args.use_dynamo:
+    return None
+  engines = known_args.dynamo_engines
+  is_legacy_default = (
+      engines <= 1 and known_args.dynamo_router_mode == 'round-robin' and
+      known_args.dynamo_kv_event_mode == 'disabled')
+  if is_legacy_default:
+    return None
+
+  if known_args.dynamo_gpu_devices:
+    devices = [d.strip() for d in known_args.dynamo_gpu_devices.split(',')]
+    if len(devices) != engines:
+      raise ValueError(
+          f'--dynamo_gpu_devices lists {len(devices)} device(s) but '
+          f'--dynamo_engines is {engines}.')
+  elif engines > 1:
+    devices = [str(i) for i in range(engines)]
+  else:
+    devices = ['']  # single engine inherits ambient GPU visibility
+
+  specs = tuple(
+      DynamoVLLMEngineSpec(gpu_devices=(d, ) if d else ()) for d in devices)
+  return DynamoRuntimeConfig(
+      engines=specs,
+      router_mode=known_args.dynamo_router_mode,
+      kv_event_mode=known_args.dynamo_kv_event_mode)
 
 
 def build_vllm_server_kwargs(known_args) -> dict[str, str]:
@@ -190,11 +258,13 @@ def run(
   effective_vllm_kwargs = (
       vllm_server_kwargs if vllm_server_kwargs is not None else
       build_vllm_server_kwargs(known_args))
+  dynamo_runtime_config = build_dynamo_runtime_config(known_args)
 
   model_handler = VLLMCompletionsModelHandler(
       model_name=known_args.model,
       vllm_server_kwargs=effective_vllm_kwargs,
-      use_dynamo=known_args.use_dynamo)
+      use_dynamo=known_args.use_dynamo,
+      dynamo_runtime_config=dynamo_runtime_config)
   input_examples = COMPLETION_EXAMPLES
 
   if known_args.chat:
@@ -202,7 +272,8 @@ def run(
         model_name=known_args.model,
         chat_template_path=known_args.chat_template,
         vllm_server_kwargs=dict(effective_vllm_kwargs),
-        use_dynamo=known_args.use_dynamo)
+        use_dynamo=known_args.use_dynamo,
+        dynamo_runtime_config=dynamo_runtime_config)
     input_examples = CHAT_EXAMPLES
 
   pipeline = test_pipeline
