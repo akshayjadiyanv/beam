@@ -40,6 +40,7 @@ import json
 import logging
 import re
 import sys
+import time
 from collections.abc import Iterable
 from typing import Any
 from typing import Optional
@@ -347,10 +348,18 @@ class FormatOutputDoFn(beam.DoFn):
     self._nvext = Metrics.counter(self.__class__, 'responses_with_nvext')
     self._with_worker_id = Metrics.counter(
         self.__class__, 'responses_with_worker_id')
+    # Wall-clock (epoch ms) of each completed inference. Its min/max/count give
+    # a steady-state THROUGHPUT window that excludes model load and worker
+    # provisioning: throughput = count / ((max - min) / 1000). This is the
+    # fair A/B/C records/s metric; batch latency alone conflates queueing under
+    # concurrency with throughput. (sum is meaningless here; use min/max/count.)
+    self._inference_wall_clock_ms = Metrics.distribution(
+        self.__class__, 'inference_wall_clock_ms')
 
   def process(
       self, element: tuple[dict[str, Any], PredictionResult]) -> Iterable[str]:
     meta, prediction = element
+    self._inference_wall_clock_ms.update(int(time.time() * 1000))
     try:
       out = format_output_record(
           meta, prediction, arm=self._arm, run_id=self._run_id)
