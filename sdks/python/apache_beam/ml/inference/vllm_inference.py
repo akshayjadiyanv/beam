@@ -123,21 +123,34 @@ def start_process(
   return process, port
 
 
-def getVLLMClient(port) -> OpenAI:
+# The OpenAI client default is 2 retries with short exponential backoff, which
+# a *sustained* 503 exhausts in ~1-2s. Under a multi-engine KV-aware router the
+# frontend can transiently return 503 ("ResourceExhausted: All workers are
+# busy") when a burst of same-prefix requests concentrates load on the engine
+# that owns that prefix; a few extra retries (exponential backoff, jitter, and
+# Retry-After are all honored by the client) let the request ride out that
+# admission-control window instead of failing the whole Beam bundle.
+_OPENAI_MAX_RETRIES = 6
+
+
+def getVLLMClient(port, max_retries: int = _OPENAI_MAX_RETRIES) -> OpenAI:
   openai_api_key = "EMPTY"
   openai_api_base = f"http://localhost:{port}/v1"
   return OpenAI(
       api_key=openai_api_key,
       base_url=openai_api_base,
+      max_retries=max_retries,
   )
 
 
-def getAsyncVLLMClient(port) -> AsyncOpenAI:
+def getAsyncVLLMClient(
+    port, max_retries: int = _OPENAI_MAX_RETRIES) -> AsyncOpenAI:
   openai_api_key = "EMPTY"
   openai_api_base = f"http://localhost:{port}/v1"
   return AsyncOpenAI(
       api_key=openai_api_key,
       base_url=openai_api_base,
+      max_retries=max_retries,
   )
 
 
