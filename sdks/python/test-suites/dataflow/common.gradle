@@ -499,6 +499,33 @@ def vllmTests = tasks.create("vllmTests") {
  }
 }
 
+// Opt-in multi-GPU (2x L4) embedded Dynamo KV-routing smoke. Intentionally NOT
+// part of inferencePostCommitITPy312 so it does not double GPU cost on every
+// postcommit run; invoke explicitly (./gradlew ...:vllmDynamoKvTests) or wire
+// it into a separate scheduled job. It validates that two GPU-pinned
+// dynamo.vllm engines start behind a KV-aware dynamo.frontend and that both
+// process work; steady-state performance is the POC benchmark's job, not a
+// pass/fail assertion here.
+def vllmDynamoKvTests = tasks.create("vllmDynamoKvTests") {
+  dependsOn 'installGcpTest'
+  dependsOn ':sdks:python:sdist'
+ doLast {
+  def argMap = vllmBaseArgMap + [
+    "machine_type": "g2-standard-24",
+    "disk_size_gb": 75,
+    "model": "Qwen/Qwen3-0.6B",
+    "output": "gs://apache-beam-ml/outputs/vllm_dynamo_kv_predictions.txt",
+    "num_workers": 1,
+    "max_num_workers": 1,
+  ]
+  def cmdArgs = mapToArgString(argMap)
+  exec {
+    executable 'sh'
+    args '-c', ". ${envdir}/bin/activate && pip install openai && python -m apache_beam.examples.inference.vllm_text_completion $cmdArgs --use_dynamo --dynamo_engines 2 --dynamo_router_mode kv --dynamo_kv_event_mode zmq --max_tokens 8 --experiment='worker_accelerator=type:nvidia-l4;count:2;install-nvidia-driver:latest' --experiment=no_use_multiple_sdk_containers"
+  }
+ }
+}
+
 // Vertex AI RunInference IT tests
 task vertexAIInferenceTest {
   dependsOn 'initializeForDataflowJob'
